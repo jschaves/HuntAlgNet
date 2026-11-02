@@ -295,8 +295,9 @@ apt-get update
 apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install \
   ca-certificates curl gnupg openssl rsync git tar gzip \
   python3 python3-venv python3-dev build-essential libpq-dev pkg-config \
-  postgresql postgresql-contrib redis-server redis-tools nginx \
-  ufw fail2ban unattended-upgrades certbot iproute2
+  postgresql postgresql-client postgresql-contrib redis-server redis-tools nginx \
+  ufw fail2ban unattended-upgrades certbot iproute2 \
+  gpg gpg-agent logrotate openssh-server systemd-timesyncd
 
 if systemctl is-active --quiet apache2 2>/dev/null; then
   systemctl disable --now apache2 || true
@@ -782,6 +783,10 @@ fi
 
 systemctl enable --now systemd-timesyncd 2>/dev/null || true
 
+if ! systemctl is-active --quiet ssh 2>/dev/null && ! systemctl is-active --quiet sshd 2>/dev/null; then
+  systemctl enable --now ssh 2>/dev/null || systemctl enable --now sshd 2>/dev/null || warn "No se pudo activar SSH."
+fi
+
 log "Activando actualizaciones de seguridad automaticas"
 cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
 APT::Periodic::Update-Package-Lists "1";
@@ -822,6 +827,22 @@ EOF
 chmod 644 /etc/systemd/journald.conf.d/huntalgnet.conf
 systemctl restart systemd-journald 2>/dev/null || true
 
+log "Configurando rotacion de logs"
+cat > /etc/logrotate.d/huntalgnet <<'EOF'
+/opt/huntalgnet/logs/*.log {
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su huntalgnet huntalgnet
+}
+EOF
+chmod 644 /etc/logrotate.d/huntalgnet
+systemctl enable --now logrotate.timer 2>/dev/null || true
+
 if [[ "$HARDEN_SSH" -eq 1 ]]; then
   log "Endureciendo SSH"
   SSH_BACKUP="/etc/ssh/sshd_config.bak.$(date +%s)"
@@ -844,6 +865,18 @@ chmod 600 "$BACKUP_KEY_FILE"
 install -d -m 0700 "$BACKUP_DIR"
 systemctl daemon-reload
 systemctl enable --now huntalgnet-backup.timer
+
+log "Verificando dependencias del sistema"
+REQUIRED_COMMANDS=(python3 curl openssl rsync git tar gzip psql redis-cli nginx certbot gpg logrotate ufw fail2ban-client)
+for command_name in "${REQUIRED_COMMANDS[@]}"; do
+  command -v "$command_name" >/dev/null 2>&1 || die "Falta el comando requerido: ${command_name}"
+done
+if [[ "$INSTALL_AI" -eq 1 ]]; then
+  command -v ollama >/dev/null 2>&1 || warn "Ollama no esta disponible; la IA local no funcionara."
+fi
+for service_name in postgresql redis-server nginx; do
+  systemctl is-active --quiet "$service_name" || die "El servicio ${service_name} no esta activo."
+done
 
 log "Verificando el despliegue"
 curl -fsS http://127.0.0.1:8000/api/v1/health >/dev/null || die "La API no responde."

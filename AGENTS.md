@@ -37,6 +37,17 @@
 - NO usar Docker en este proyecto.
 - Multi-tenant: organizaciones, usuarios y roles (`owner`, `admin`, `editor`, `analyst`, `viewer`).
 
+## Instalador (obligatorio)
+
+- `deploy/install.sh` debe instalar y configurar TODAS las dependencias de sistema,
+  servicios, paquetes y utilidades que la aplicacion necesite (PostgreSQL, Redis, Nginx,
+  Ollama, GPG, logrotate, firewall, fail2ban, TLS, sincronizacion horaria, etc.).
+- Cada vez que se anada una nueva dependencia, servicio o programa al proyecto, se debe
+  anadir en el mismo cambio su instalacion y configuracion completa en `deploy/install.sh`
+  (y en `deploy/update.sh` si afecta a actualizaciones).
+- El instalador debe verificar que los comandos y servicios requeridos existen y estan
+  activos antes de finalizar, y debe ser idempotente.
+
 ## Seguridad
 
 - Secretos solo en `.env` con permisos `600`, nunca en el repositorio.
