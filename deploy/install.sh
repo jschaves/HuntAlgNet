@@ -470,13 +470,22 @@ runuser -u "$APP_USER" -- bash -c "cd '${APP_DIR}' && venv/bin/python -m app.cli
 
 log "Configurando PostgreSQL"
 systemctl enable --now postgresql
+PG_READY=0
 for _ in {1..30}; do
-  runuser -u postgres -- psql -tAc "SELECT 1" >/dev/null 2>&1 && break
+  if runuser -u postgres -- psql -tAc "SELECT 1" >/dev/null 2>&1; then
+    PG_READY=1
+    break
+  fi
   sleep 1
 done
+[[ "$PG_READY" -eq 1 ]] || die "PostgreSQL no responde."
 
-PG_CONF_DIR="$(find /etc/postgresql -maxdepth 2 -name postgresql.conf -printf '%h\n' 2>/dev/null | head -n1 || true)"
-[[ -n "$PG_CONF_DIR" ]] || die "No se encontro la configuracion de PostgreSQL."
+PG_CONF_FILE="$(runuser -u postgres -- psql -tAc "SHOW config_file;" 2>/dev/null | head -n1 | tr -d '[:space:]')"
+if [[ -z "$PG_CONF_FILE" || ! -f "$PG_CONF_FILE" ]]; then
+  PG_CONF_FILE="$(find /etc/postgresql -maxdepth 4 -name postgresql.conf -print -quit 2>/dev/null || true)"
+fi
+[[ -n "$PG_CONF_FILE" && -f "$PG_CONF_FILE" ]] || die "No se encontro la configuracion de PostgreSQL."
+PG_CONF_DIR="$(dirname "$PG_CONF_FILE")"
 
 runuser -u postgres -- psql -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET password_encryption = 'scram-sha-256';" >/dev/null
 runuser -u postgres -- psql -v ON_ERROR_STOP=1 -c "SELECT pg_reload_conf();" >/dev/null
