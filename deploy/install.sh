@@ -21,30 +21,57 @@ YOUTUBE_SCOPES="${YOUTUBE_SCOPES:-https://www.googleapis.com/auth/youtube.readon
 OLLAMA_VERSION="${OLLAMA_VERSION:-}"
 OLLAMA_INSTALL_SHA256="${OLLAMA_INSTALL_SHA256:-}"
 OLLAMA_MODEL="${OLLAMA_MODEL:-}"
-INSTALL_AI="${INSTALL_AI:-1}"
+INSTALL_AI="${INSTALL_AI:-}"
+INSTALL_AI_SET=0
+if [[ -n "$INSTALL_AI" ]]; then
+  INSTALL_AI_SET=1
+fi
 ENABLE_FIREWALL="${ENABLE_FIREWALL:-1}"
 ENABLE_FAIL2BAN="${ENABLE_FAIL2BAN:-1}"
 HARDEN_SYSCTL="${HARDEN_SYSCTL:-1}"
 HARDEN_SSH="${HARDEN_SSH:-0}"
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_URL="${REPO_URL:-https://github.com/jschaves/HuntAlgNet.git}"
+REPO_BRANCH="${REPO_BRANCH:-main}"
+USE_LOCAL_REPO="${USE_LOCAL_REPO:-1}"
+FORCE_CLONE="${FORCE_CLONE:-0}"
+ASSUME_YES="${ASSUME_YES:-0}"
+INTERACTIVE=0
+CLONE_DIR=""
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
+if [[ -n "$SCRIPT_SOURCE" && -f "$SCRIPT_SOURCE" ]]; then
+  REPO_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")/.." 2>/dev/null && pwd || true)"
+else
+  REPO_DIR=""
+fi
 
 log() { printf '\n==> %s\n' "$*"; }
 warn() { printf '\n[!] %s\n' "$*" >&2; }
 die() { printf '\n[ERROR] %s\n' "$*" >&2; exit 1; }
+cleanup() {
+  if [[ -n "$CLONE_DIR" && -d "$CLONE_DIR" ]]; then
+    rm -rf "$CLONE_DIR"
+  fi
+}
+trap cleanup EXIT
 trap 'die "Fallo inesperado en la linea ${LINENO}"' ERR
 
 usage() {
   cat <<'EOF'
 Uso: bash deploy/install.sh [opciones]
 
+Descarga el repositorio automaticamente si el script no se ejecuta desde un
+checkout local. Si no se indica dominio, se instala en modo local (localhost).
+
 Variables de entorno:
-  DOMAIN=dominio.com          Dominio publico (si se omite se detecta la IP)
+  DOMAIN=dominio.com          Dominio publico (si se omite se usa localhost)
   EMAIL=admin@dominio.com     Email para Let's Encrypt
   ADMIN_EMAIL=...             Email del superadministrador
   ADMIN_PASSWORD=...          Contrasena inicial (si se omite se genera)
   GOOGLE_CLIENT_ID=...        Credencial OAuth de Google
   GOOGLE_CLIENT_SECRET=...    Secreto OAuth de Google
+  REPO_URL=...                Repositorio git a descargar
+  REPO_BRANCH=...             Rama del repositorio (por defecto main)
   INSTALL_AI=0|1              Instalar Ollama y modelo (por defecto 1)
   OLLAMA_VERSION=...          Version de Ollama a instalar
   OLLAMA_INSTALL_SHA256=...   Checksum SHA256 del instalador de Ollama
@@ -53,6 +80,7 @@ Variables de entorno:
   ENABLE_FAIL2BAN=0|1         Configurar fail2ban (por defecto 1)
   HARDEN_SYSCTL=0|1           Aplicar sysctl de seguridad (por defecto 1)
   HARDEN_SSH=0|1              Endurecer SSH (por defecto 0, evita bloqueos)
+  ASSUME_YES=0|1              No hacer preguntas (por defecto 0)
 
 Opciones:
   --domain VALUE
@@ -60,6 +88,12 @@ Opciones:
   --admin-email VALUE
   --admin-password VALUE
   --ollama-model VALUE
+  --repo-url VALUE
+  --repo-branch VALUE
+  --localhost
+  --yes
+  --force-clone
+  --use-local
   --no-ai
   --no-firewall
   --no-fail2ban
@@ -75,7 +109,13 @@ while [[ $# -gt 0 ]]; do
     --admin-email) ADMIN_EMAIL="${2:-}"; shift 2 ;;
     --admin-password) ADMIN_PASSWORD="${2:-}"; shift 2 ;;
     --ollama-model) OLLAMA_MODEL="${2:-}"; shift 2 ;;
-    --no-ai) INSTALL_AI=0; shift ;;
+    --repo-url) REPO_URL="${2:-}"; shift 2 ;;
+    --repo-branch) REPO_BRANCH="${2:-}"; shift 2 ;;
+    --localhost) DOMAIN="localhost"; shift ;;
+    --yes) ASSUME_YES=1; shift ;;
+    --force-clone) FORCE_CLONE=1; shift ;;
+    --use-local) USE_LOCAL_REPO=1; shift ;;
+    --no-ai) INSTALL_AI=0; INSTALL_AI_SET=1; shift ;;
     --no-firewall) ENABLE_FIREWALL=0; shift ;;
     --no-fail2ban) ENABLE_FAIL2BAN=0; shift ;;
     --harden-ssh) HARDEN_SSH=1; shift ;;
@@ -83,6 +123,35 @@ while [[ $# -gt 0 ]]; do
     *) die "Opcion desconocida: $1" ;;
   esac
 done
+
+if [[ "$ASSUME_YES" -eq 0 ]] && { [[ -t 0 ]] || [[ -r /dev/tty ]]; }; then
+  INTERACTIVE=1
+fi
+
+ask() {
+  local prompt="$1" default="$2" value=""
+  if [[ "$INTERACTIVE" -eq 1 ]]; then
+    if [[ -t 0 ]]; then
+      read -r -p "$prompt" value || true
+    else
+      read -r -p "$prompt" value < /dev/tty || true
+    fi
+  fi
+  printf '%s' "${value:-$default}"
+}
+
+ask_secret() {
+  local prompt="$1" value=""
+  if [[ "$INTERACTIVE" -eq 1 ]]; then
+    if [[ -t 0 ]]; then
+      read -rs -p "$prompt" value || true
+    else
+      read -rs -p "$prompt" value < /dev/tty || true
+    fi
+    printf '\n'
+  fi
+  printf '%s' "$value"
+}
 
 [[ "${EUID}" -eq 0 ]] || die "Ejecuta este instalador como root."
 [[ -f /etc/os-release ]] || die "No se puede detectar el sistema operativo."
@@ -92,7 +161,132 @@ case "${ID:-}" in
   *) die "Solo se soportan Ubuntu y Debian." ;;
 esac
 command -v systemctl >/dev/null 2>&1 || die "systemd es obligatorio."
-[[ -d "$REPO_DIR" ]] || die "No se encuentra el directorio del proyecto."
+if [[ -z "$DOMAIN" ]]; then
+  DOMAIN="$(ask "Dominio publico (Enter para localhost): " "localhost")"
+fi
+DOMAIN="${DOMAIN#http://}"
+DOMAIN="${DOMAIN#https://}"
+DOMAIN="${DOMAIN%%/*}"
+DOMAIN="${DOMAIN,,}"
+DOMAIN="${DOMAIN:-localhost}"
+
+if [[ "$DOMAIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  IS_IP=1
+else
+  [[ "$DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || die "Dominio invalido: $DOMAIN"
+  IS_IP=0
+fi
+
+if [[ "$DOMAIN" == "localhost" || "$DOMAIN" == "127.0.0.1" ]]; then
+  IS_LOCAL=1
+  HTTP_LISTEN="127.0.0.1:80"
+  HTTP_LISTEN6="[::1]:80"
+  HTTPS_LISTEN="127.0.0.1:443"
+  HTTPS_LISTEN6="[::1]:443"
+else
+  IS_LOCAL=0
+  HTTP_LISTEN="80"
+  HTTP_LISTEN6="[::]:80"
+  HTTPS_LISTEN="443"
+  HTTPS_LISTEN6="[::]:443"
+fi
+
+if [[ "$IS_LOCAL" -eq 0 && -z "$EMAIL" ]]; then
+  EMAIL="$(ask "Email para Let's Encrypt (opcional, Enter para omitir): " "")"
+fi
+if [[ -n "$EMAIL" && "$EMAIL" != *"@"* ]]; then
+  die "EMAIL invalido."
+fi
+
+DEFAULT_ADMIN_EMAIL="admin@example.com"
+if [[ "$IS_IP" -eq 0 && "$IS_LOCAL" -eq 0 && "$DOMAIN" == *.* ]]; then
+  DEFAULT_ADMIN_EMAIL="admin@${DOMAIN}"
+fi
+if [[ -z "$ADMIN_EMAIL" ]]; then
+  ADMIN_EMAIL="$(ask "Email del superadministrador [${DEFAULT_ADMIN_EMAIL}]: " "$DEFAULT_ADMIN_EMAIL")"
+fi
+ADMIN_EMAIL="${ADMIN_EMAIL:-$DEFAULT_ADMIN_EMAIL}"
+[[ "$ADMIN_EMAIL" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || die "ADMIN_EMAIL invalido."
+
+if [[ -z "$ADMIN_PASSWORD" ]]; then
+  ADMIN_PASSWORD="$(ask_secret "Contrasena del superadministrador (Enter para generar): ")"
+fi
+if [[ -n "$ADMIN_PASSWORD" ]]; then
+  (( ${#ADMIN_PASSWORD} >= 8 )) || die "ADMIN_PASSWORD debe tener al menos 8 caracteres."
+  if [[ "$ADMIN_PASSWORD" == *"'"* || "$ADMIN_PASSWORD" == *$'\n'* ]]; then
+    die "ADMIN_PASSWORD no puede contener comillas simples ni saltos de linea."
+  fi
+fi
+
+if [[ -z "$GOOGLE_CLIENT_ID" ]]; then
+  GOOGLE_CLIENT_ID="$(ask "GOOGLE_CLIENT_ID (opcional, Enter para omitir): " "")"
+fi
+if [[ -n "$GOOGLE_CLIENT_ID" && -z "$GOOGLE_CLIENT_SECRET" ]]; then
+  GOOGLE_CLIENT_SECRET="$(ask_secret "GOOGLE_CLIENT_SECRET: ")"
+fi
+
+if [[ -n "$GOOGLE_CLIENT_ID" && ! "$GOOGLE_CLIENT_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  die "GOOGLE_CLIENT_ID contiene caracteres invalidos."
+fi
+if [[ -n "$GOOGLE_CLIENT_SECRET" && ! "$GOOGLE_CLIENT_SECRET" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  die "GOOGLE_CLIENT_SECRET contiene caracteres invalidos."
+fi
+
+if [[ "$INSTALL_AI_SET" -eq 0 ]]; then
+  AI_ANSWER="$(ask "Instalar IA local con Ollama? [S/n]: " "S")"
+  case "${AI_ANSWER,,}" in
+    n|no) INSTALL_AI=0 ;;
+    *) INSTALL_AI=1 ;;
+  esac
+fi
+INSTALL_AI="${INSTALL_AI:-1}"
+
+if [[ -z "$OLLAMA_MODEL" ]]; then
+  MEM_GB="$(awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo 2>/dev/null || printf '0')"
+  if (( MEM_GB >= 16 )); then
+    DEFAULT_OLLAMA_MODEL="qwen2.5:7b"
+  else
+    DEFAULT_OLLAMA_MODEL="llama3.2:3b"
+  fi
+  if [[ "$INSTALL_AI" -eq 1 ]]; then
+    OLLAMA_MODEL="$(ask "Modelo Ollama [${DEFAULT_OLLAMA_MODEL}]: " "$DEFAULT_OLLAMA_MODEL")"
+  else
+    OLLAMA_MODEL="$DEFAULT_OLLAMA_MODEL"
+  fi
+fi
+[[ "$OLLAMA_MODEL" =~ ^[A-Za-z0-9._:/-]+$ ]] || die "OLLAMA_MODEL invalido."
+
+[[ -n "$REPO_URL" ]] || die "REPO_URL no puede estar vacio."
+[[ "$REPO_BRANCH" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ ]] || die "REPO_BRANCH invalido."
+
+if [[ "$INTERACTIVE" -eq 1 ]]; then
+  MODE_LABEL="publico"
+  [[ "$IS_LOCAL" -eq 1 ]] && MODE_LABEL="local"
+  AI_LABEL="no"
+  [[ "$INSTALL_AI" -eq 1 ]] && AI_LABEL="si (${OLLAMA_MODEL})"
+  printf '\nResumen de instalacion:\n'
+  printf '  Repositorio:   %s (%s)\n' "$REPO_URL" "$REPO_BRANCH"
+  printf '  Dominio:       %s (%s)\n' "$DOMAIN" "$MODE_LABEL"
+  printf '  Admin:         %s\n' "$ADMIN_EMAIL"
+  if [[ -n "$ADMIN_PASSWORD" ]]; then
+    printf '  Password:      definida por el usuario\n'
+  else
+    printf '  Password:      gestionada por el instalador\n'
+  fi
+  if [[ -n "$GOOGLE_CLIENT_ID" && -n "$GOOGLE_CLIENT_SECRET" ]]; then
+    printf '  YouTube OAuth: configurado\n'
+  else
+    printf '  YouTube OAuth: pendiente\n'
+  fi
+  printf '  IA local:      %s\n' "$AI_LABEL"
+  CONFIRM_ANSWER="$(ask "Continuar con la instalacion? [S/n]: " "S")"
+  case "${CONFIRM_ANSWER,,}" in
+    n|no)
+      printf 'Instalacion cancelada.\n'
+      exit 0
+      ;;
+  esac
+fi
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -111,48 +305,16 @@ fi
 python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' \
   || die "Se requiere Python 3.10 o superior."
 
-if [[ -z "$DOMAIN" && -t 0 ]]; then
-  read -r -p "Dominio publico (vacio = IP con TLS autofirmado): " DOMAIN || true
-fi
-if [[ -z "$DOMAIN" ]]; then
-  DOMAIN="$(curl -fsS --max-time 5 https://api4.ipify.org 2>/dev/null || true)"
-fi
-if [[ -z "$DOMAIN" ]]; then
-  DOMAIN="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)"
-fi
-[[ -n "$DOMAIN" ]] || die "No se pudo detectar el dominio ni la IP."
-DOMAIN="${DOMAIN#http://}"
-DOMAIN="${DOMAIN#https://}"
-DOMAIN="${DOMAIN%%/*}"
-DOMAIN="${DOMAIN,,}"
-
-if [[ "$DOMAIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  IS_IP=1
+if [[ "$FORCE_CLONE" -eq 0 && "$USE_LOCAL_REPO" -eq 1 && -n "$REPO_DIR" && -f "$REPO_DIR/requirements.txt" && -f "$REPO_DIR/app/main.py" ]]; then
+  log "Usando repositorio local ${REPO_DIR} (usa --force-clone para descargar desde ${REPO_URL})"
 else
-  [[ "$DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || die "Dominio invalido: $DOMAIN"
-  IS_IP=0
+  log "Descargando repositorio ${REPO_URL} (${REPO_BRANCH})"
+  CLONE_DIR="$(mktemp -d)"
+  GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch "$REPO_BRANCH" -- "$REPO_URL" "$CLONE_DIR/repo"
+  REPO_DIR="$CLONE_DIR/repo"
 fi
-
-if [[ -n "$EMAIL" && "$EMAIL" != *"@"* ]]; then
-  die "EMAIL invalido."
-fi
-
-if [[ -t 0 ]]; then
-  if [[ -z "$GOOGLE_CLIENT_ID" ]]; then
-    read -r -p "GOOGLE_CLIENT_ID (Enter para omitir): " GOOGLE_CLIENT_ID || true
-  fi
-  if [[ -n "$GOOGLE_CLIENT_ID" && -z "$GOOGLE_CLIENT_SECRET" ]]; then
-    read -r -s -p "GOOGLE_CLIENT_SECRET: " GOOGLE_CLIENT_SECRET || true
-    printf '\n'
-  fi
-fi
-
-if [[ -n "$GOOGLE_CLIENT_ID" && ! "$GOOGLE_CLIENT_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
-  die "GOOGLE_CLIENT_ID contiene caracteres invalidos."
-fi
-if [[ -n "$GOOGLE_CLIENT_SECRET" && ! "$GOOGLE_CLIENT_SECRET" =~ ^[A-Za-z0-9._-]+$ ]]; then
-  die "GOOGLE_CLIENT_SECRET contiene caracteres invalidos."
-fi
+[[ -f "$REPO_DIR/requirements.txt" ]] || die "El repositorio no contiene requirements.txt."
+REPO_COMMIT="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || true)"
 
 log "Creando usuario y directorios"
 if ! id -u "$APP_USER" >/dev/null 2>&1; then
@@ -232,23 +394,7 @@ if (( ${#SECRET_KEY} < 32 )); then
   warn "SECRET_KEY es corta; considera regenerarla."
 fi
 
-if [[ -z "$OLLAMA_MODEL" ]]; then
-  MEM_GB="$(awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo 2>/dev/null || printf '0')"
-  if (( MEM_GB >= 16 )); then
-    OLLAMA_MODEL="qwen2.5:7b"
-  else
-    OLLAMA_MODEL="llama3.2:3b"
-  fi
-fi
 [[ "$OLLAMA_MODEL" =~ ^[A-Za-z0-9._:/-]+$ ]] || die "OLLAMA_MODEL invalido."
-
-if [[ -z "$ADMIN_EMAIL" ]]; then
-  if [[ "$IS_IP" -eq 1 || "$DOMAIN" != *.* ]]; then
-    ADMIN_EMAIL="admin@example.com"
-  else
-    ADMIN_EMAIL="admin@${DOMAIN}"
-  fi
-fi
 [[ "$ADMIN_EMAIL" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || die "ADMIN_EMAIL invalido."
 
 if [[ -z "$ADMIN_PASSWORD" && -f "$ADMIN_CRED_FILE" ]]; then
@@ -454,8 +600,8 @@ chmod 644 /etc/nginx/snippets/huntalgnet-proxy.conf /etc/nginx/conf.d/huntalgnet
 
 cat > /etc/nginx/sites-available/huntalgnet <<EOF
 server {
-    listen 80;
-    listen [::]:80;
+    listen ${HTTP_LISTEN};
+    listen ${HTTP_LISTEN6};
     server_name ${DOMAIN};
 
     location /.well-known/acme-challenge/ {
@@ -477,7 +623,7 @@ systemctl enable --now nginx
 systemctl reload nginx
 
 TLS_MODE="selfsigned"
-if [[ "$IS_IP" -eq 0 ]]; then
+if [[ "$IS_IP" -eq 0 && "$IS_LOCAL" -eq 0 ]]; then
   CERTBOT_ARGS=(certonly --webroot -w "$ACME_ROOT" -d "$DOMAIN" --non-interactive --agree-tos --keep-until-expiring --deploy-hook "systemctl reload nginx")
   if [[ -n "$EMAIL" ]]; then
     CERTBOT_ARGS+=(-m "$EMAIL")
@@ -522,6 +668,10 @@ sed -e "s|__DOMAIN__|${DOMAIN}|g" \
     -e "s|__SSL_CERT__|${SSL_CERT}|g" \
     -e "s|__SSL_KEY__|${SSL_KEY}|g" \
     -e "s|__ACME_ROOT__|${ACME_ROOT}|g" \
+    -e "s|__HTTP_LISTEN__|${HTTP_LISTEN}|g" \
+    -e "s|__HTTP_LISTEN6__|${HTTP_LISTEN6}|g" \
+    -e "s|__HTTPS_LISTEN__|${HTTPS_LISTEN}|g" \
+    -e "s|__HTTPS_LISTEN6__|${HTTPS_LISTEN6}|g" \
     "$APP_DIR/deploy/nginx/huntalgnet.conf" > /etc/nginx/sites-available/huntalgnet
 chmod 644 /etc/nginx/sites-available/huntalgnet
 nginx -t
@@ -577,8 +727,12 @@ if [[ "$ENABLE_FIREWALL" -eq 1 ]]; then
   log "Configurando firewall UFW"
   ufw default deny incoming
   ufw default allow outgoing
-  ufw allow 80/tcp
-  ufw allow 443/tcp
+  if [[ "$IS_LOCAL" -eq 1 ]]; then
+    ufw allow in on lo
+  else
+    ufw allow 80/tcp
+    ufw allow 443/tcp
+  fi
   SSH_PORTS="$(sshd -T 2>/dev/null | awk '/^port /{print $2}' | sort -u || true)"
   if command -v ss >/dev/null 2>&1; then
     SS_PORTS="$(ss -tlnp 2>/dev/null | awk '/sshd/ {print $4}' | sed 's/.*://' | sort -u || true)"
@@ -701,22 +855,31 @@ else
     || die "Nginx no responde por HTTPS."
 fi
 
-if [[ "$IS_IP" -eq 1 || "$TLS_MODE" != "letsencrypt" ]]; then
+if [[ "$IS_LOCAL" -eq 1 ]]; then
+  warn "Modo local: la aplicacion solo escucha en loopback (127.0.0.1). Para publicarla, reejecuta con DOMAIN=tudominio.com."
+elif [[ "$IS_IP" -eq 1 || "$TLS_MODE" != "letsencrypt" ]]; then
   warn "TLS no es de confianza publica. Configura un dominio con DNS y vuelve a ejecutar para Let's Encrypt."
 fi
 if [[ -z "$GOOGLE_CLIENT_ID" || -z "$GOOGLE_CLIENT_SECRET" ]]; then
   warn "YouTube OAuth no configurado. Anade GOOGLE_CLIENT_ID y GOOGLE_CLIENT_SECRET en ${ENV_FILE} y reinicia huntalgnet-api."
 fi
 
+MODE_LABEL="publico"
+[[ "$IS_LOCAL" -eq 1 ]] && MODE_LABEL="local"
+AI_OUTPUT="${OLLAMA_MODEL} (127.0.0.1:11434)"
+[[ "$INSTALL_AI" -ne 1 ]] && AI_OUTPUT="no instalada"
+
 cat <<EOF
 
 Instalacion completada.
 
 URL:              https://${DOMAIN}
+Modo:             ${MODE_LABEL}
+Repositorio:      ${REPO_URL} (${REPO_BRANCH}${REPO_COMMIT:+, ${REPO_COMMIT}})
 Admin:            ${ADMIN_EMAIL}
 Credenciales:     ${ADMIN_CRED_FILE}
 Backup cifrado:   ${BACKUP_DIR} (clave en ${BACKUP_KEY_FILE})
-IA local:         ${OLLAMA_MODEL} (127.0.0.1:11434)
+IA local:         ${AI_OUTPUT}
 TLS:              ${TLS_MODE}
 
 Servicios:
